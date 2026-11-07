@@ -2,11 +2,13 @@
 // Paradigm: Self-contained assertion test over synthetic mosaics.
 // Role: Guards channel order and parity handling that the CUDA kernel reuses.
 
+#include "bayer.hpp"
+
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-
-#include "bayer.hpp"
 
 namespace
 {
@@ -22,36 +24,39 @@ struct Rgb
 using Scene = Rgb (*)(int, int);
 
 Rgb flat(int, int) { return {200, 100, 50}; }
-Rgb ramp(int x, int y) { return {x * 2, 255 - y * 4, (x + y) * 2}; }
+Rgb ramp(const int x, const int y) { return {x * 2, 255 - y * 4, (x + y) * 2}; }
+
+std::size_t at(const int x, const int y) { return static_cast<std::size_t>(y * kWidth + x); }
 
 // Keep only the colour sample the sensor would record at each site.
-std::vector<uint8_t> mosaic(const io::Bayer & p, Scene scene)
+std::vector<std::uint8_t> mosaic(const io::Bayer & p, const Scene scene)
 {
-  std::vector<uint8_t> raw(kWidth * kHeight);
+  std::vector<std::uint8_t> raw(static_cast<std::size_t>(kWidth * kHeight));
   for (int y = 0; y < kHeight; ++y)
     for (int x = 0; x < kWidth; ++x) {
       const bool red_row = ((y ^ p.red_row) & 1) == 0;
       const bool red_col = ((x ^ p.red_col) & 1) == 0;
       const Rgb c = scene(x, y);
-      raw[y * kWidth + x] = red_row == red_col ? (red_row ? c.r : c.b) : c.g;
+      const int sample = red_row == red_col ? (red_row ? c.r : c.b) : c.g;
+      raw[at(x, y)] = static_cast<std::uint8_t>(sample);
     }
   return raw;
 }
 
 // Largest per-channel error over the pixels in [margin, size - margin).
-int max_error(const io::Bayer & p, Scene scene, int margin)
+int max_error(const io::Bayer & p, const Scene scene, const int margin)
 {
   const auto raw = mosaic(p, scene);
   int worst = 0;
   for (int y = margin; y < kHeight - margin; ++y)
     for (int x = margin; x < kWidth - margin; ++x) {
-      const auto at = [&](int dx, int dy) {
-        return raw[io::reflect(y + dy, kHeight) * kWidth + io::reflect(x + dx, kWidth)];
+      const auto sample = [&](const int dx, const int dy) {
+        return static_cast<int>(raw[at(io::reflect(x + dx, kWidth), io::reflect(y + dy, kHeight))]);
       };
-      const io::Bgr got = io::demosaic(p, x, y, at);
+      const io::Bgr got = io::demosaic(p, x, y, sample);
       const Rgb want = scene(x, y);
-      for (int e : {std::abs(got.r - want.r), std::abs(got.g - want.g), std::abs(got.b - want.b)})
-        if (e > worst) worst = e;
+      worst = std::max(
+        {worst, std::abs(got.r - want.r), std::abs(got.g - want.g), std::abs(got.b - want.b)});
     }
   return worst;
 }
@@ -64,7 +69,8 @@ int main()
   {
     const char * name;
     io::Bayer pattern;
-  } layouts[] = {{"RGGB", {0, 0}}, {"GRBG", {0, 1}}, {"GBRG", {1, 0}}, {"BGGR", {1, 1}}};
+  } layouts[] = {
+    {"RGGB", io::kRggb}, {"GRBG", io::kGrbg}, {"GBRG", io::kGbrg}, {"BGGR", io::kBggr}};
 
   int failures = 0;
   for (const auto & l : layouts) {
@@ -74,8 +80,9 @@ int main()
     // A linear ramp is reproduced to rounding away from the border (reflection bends it there).
     const int ramp_error = max_error(l.pattern, ramp, 1);
     const bool pass = flat_error == 0 && ramp_error <= 1;
-    std::printf("%s: flat error %d, ramp error %d  %s\n", l.name, flat_error, ramp_error,
-                pass ? "ok" : "FAIL");
+    std::printf(
+      "%s: flat error %d, ramp error %d  %s\n", l.name, flat_error, ramp_error,
+      pass ? "ok" : "FAIL");
     failures += !pass;
   }
 

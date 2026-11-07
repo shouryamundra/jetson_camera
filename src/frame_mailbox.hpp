@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <concepts>
 #include <cstdint>
 
 namespace io
@@ -19,21 +20,31 @@ template <typename T>
 class FrameMailbox
 {
 public:
-  // Slot the producer may fill. Call publish() when it is complete.
-  T & write_slot() { return slots_[write_]; }
+  FrameMailbox()
+    requires std::default_initializable<T>
+  = default;
 
-  void publish()
+  // Builds each slot by calling `make()`, for slots that are not default constructible.
+  template <std::invocable<> Make>
+  explicit FrameMailbox(Make && make) : slots_{make(), make(), make()}
   {
-    const uint32_t previous = middle_.exchange(write_ | kFresh, std::memory_order_acq_rel);
+  }
+
+  // Slot the producer may fill. Call publish() when it is complete.
+  [[nodiscard]] T & write_slot() noexcept { return slots_[write_]; }
+
+  void publish() noexcept
+  {
+    const std::uint32_t previous = middle_.exchange(write_ | kFresh, std::memory_order_acq_rel);
     write_ = previous & kIndex;
     middle_.notify_one();
   }
 
   // Newest published frame, sleeping until one exists. The slot stays valid until the next
   // acquire(). Returns nullptr once closed.
-  T * acquire()
+  [[nodiscard]] T * acquire() noexcept
   {
-    uint32_t state = middle_.load(std::memory_order_acquire);
+    std::uint32_t state = middle_.load(std::memory_order_acquire);
     while (!(state & (kFresh | kClosed))) {
       middle_.wait(state, std::memory_order_acquire);
       state = middle_.load(std::memory_order_acquire);
@@ -44,32 +55,29 @@ public:
   }
 
   // Wakes a blocked acquire(), which returns nullptr. Call only after the producer has stopped.
-  void close()
+  void close() noexcept
   {
     middle_.fetch_or(kClosed, std::memory_order_acq_rel);
     middle_.notify_all();
   }
 
   // Forget all frames and reopen. Call only while neither side is running.
-  void reset()
+  void reset() noexcept
   {
     write_ = 0;
     read_ = 1;
     middle_.store(2, std::memory_order_release);
   }
 
-  // Backing storage, for one-time setup before use.
-  std::array<T, 3> & slots() { return slots_; }
-
 private:
-  static constexpr uint32_t kIndex = 3;
-  static constexpr uint32_t kFresh = 4;
-  static constexpr uint32_t kClosed = 8;
+  static constexpr std::uint32_t kIndex = 3;
+  static constexpr std::uint32_t kFresh = 4;
+  static constexpr std::uint32_t kClosed = 8;
 
-  std::array<T, 3> slots_{};
-  uint32_t write_ = 0;  // owned by the producer
-  uint32_t read_ = 1;   // owned by the consumer
-  std::atomic<uint32_t> middle_{2};
+  std::array<T, 3> slots_;
+  std::uint32_t write_ = 0;  // owned by the producer
+  std::uint32_t read_ = 1;   // owned by the consumer
+  std::atomic<std::uint32_t> middle_{2};
 };
 
 }  // namespace io

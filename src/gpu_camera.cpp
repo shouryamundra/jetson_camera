@@ -1,14 +1,15 @@
 // Purpose: Capture raw Hikrobot frames into pinned memory and convert them on the GPU.
-// Paradigm: Object-oriented SDK adapter with a capture thread and a lock-free frame handoff.
+// Paradigm: RAII-owned pipeline with a capture thread and a lock-free frame handoff.
 // Role: Supplies timestamped BGRA frames that GPU work can consume without any CPU copy.
 
 #include "gpu_camera.hpp"
 
 #include <cstdio>
+#include <exception>
 #include <stdexcept>
-#include <string>
 
-#include "MvCameraControl.h"
+#include "PixelType.h"
+#include "demosaic.hpp"
 
 using namespace std::chrono_literals;
 
@@ -16,194 +17,117 @@ namespace io
 {
 namespace
 {
-constexpr unsigned kTimeoutMs = 100;  // per-frame wait; a stalled camera is noticed within this
-constexpr int kMaxFailures = 10;      // consecutive failed waits (~1 s) before reopening the device
+constexpr auto kFrameTimeout = 100ms;  // a stalled camera is noticed within this
+constexpr int kMaxFailures = 10;       // consecutive failed waits (about 1 s) before reopening
+constexpr auto kRetryDelay = 100ms;
 
-bool ok(int ret, const char * what)
-{
-  if (ret == MV_OK) return true;
-  std::fprintf(stderr, "%s failed: %#x\n", what, static_cast<unsigned>(ret));
-  return false;
-}
-
-void check(cudaError_t error, const char * what)
-{
-  if (error != cudaSuccess)
-    throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(error));
-}
-
-bool read_int(void * handle, const char * key, unsigned & value)
-{
-  MVCC_INTVALUE_EX v;
-  if (!ok(MV_CC_GetIntValueEx(handle, key, &v), key)) return false;
-  value = static_cast<unsigned>(v.nCurValue);
-  return true;
-}
-
-bool bayer_of(unsigned pixel_type, Bayer & pattern)
+Bayer bayer_of(const std::uint32_t pixel_type)
 {
   switch (pixel_type) {
-    case PixelType_Gvsp_BayerRG8: pattern = {0, 0}; return true;
-    case PixelType_Gvsp_BayerGR8: pattern = {0, 1}; return true;
-    case PixelType_Gvsp_BayerGB8: pattern = {1, 0}; return true;
-    case PixelType_Gvsp_BayerBG8: pattern = {1, 1}; return true;
-    default: return false;
+    case PixelType_Gvsp_BayerRG8:
+      return kRggb;
+    case PixelType_Gvsp_BayerGR8:
+      return kGrbg;
+    case PixelType_Gvsp_BayerGB8:
+      return kGbrg;
+    case PixelType_Gvsp_BayerBG8:
+      return kBggr;
+    default:
+      throw std::runtime_error("unsupported pixel format; set PixelFormat to an 8-bit Bayer type");
   }
 }
 
 }  // namespace
 
-GpuCamera::GpuCamera(const std::string & ini_path, Roi roi) : ini_path_(ini_path), roi_(roi)
+GpuCamera::GpuCamera(const std::string & ini_path)
+: ini_path_(ini_path),
+  device_(std::make_unique<MvsDevice>(ini_path)),
+  geometry_(device_->geometry()),
+  bayer_(bayer_of(geometry_.pixel_type)),
+  mailbox_([this] { return Slot{cuda::PinnedBuffer(geometry_.payload)}; }),
+  output_(cuda::make_device_buffer<uchar4>(std::size_t{geometry_.width} * geometry_.height)),
+  stream_(cuda::make_stream())
 {
-  // Spin while waiting on the GPU for the lowest wake-up latency. This only takes effect before
-  // the CUDA context exists; if the host application already created one, keep its settings.
-  if (cudaSetDeviceFlags(cudaDeviceScheduleSpin | cudaDeviceMapHost) == cudaErrorSetOnActiveProcess)
-    cudaGetLastError();
-
-  if (!open_device(geometry_)) throw std::runtime_error("cannot open camera");
-  if (!bayer_of(geometry_.pixel_type, bayer_))
-    throw std::runtime_error("unsupported pixel format; set PixelFormat to an 8-bit Bayer type");
-
-  if (roi_.width == 0 || roi_.height == 0)
-    roi_ = {0, 0, int(geometry_.width), int(geometry_.height)};
-  if (
-    roi_.x < 0 || roi_.y < 0 || roi_.width < 0 || roi_.height < 0 ||
-    roi_.x + roi_.width > int(geometry_.width) || roi_.y + roi_.height > int(geometry_.height))
-    throw std::invalid_argument("roi does not fit the camera frame");
-
-  check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "cudaStreamCreate");
-  check(cudaMalloc(&output_, size_t(roi_.width) * roi_.height * sizeof(uchar4)), "cudaMalloc");
-  for (Slot & slot : mailbox_.slots()) {
-    void * host = nullptr;
-    void * device = nullptr;
-    check(cudaHostAlloc(&host, geometry_.payload, cudaHostAllocMapped), "cudaHostAlloc");
-    check(cudaHostGetDevicePointer(&device, host, 0), "cudaHostGetDevicePointer");
-    slot.host = static_cast<uint8_t *>(host);
-    slot.device = static_cast<const uint8_t *>(device);
-  }
 }
 
 GpuCamera::~GpuCamera()
 {
   stop();
-  close_device();
-  for (Slot & slot : mailbox_.slots()) cudaFreeHost(slot.host);
-  cudaFree(output_);
-  if (stream_) cudaStreamDestroy(stream_);
+  cudaStreamSynchronize(stream_.get());
 }
 
 void GpuCamera::start()
 {
-  if (capture_thread_.joinable()) return;
-  if (!ok(MV_CC_StartGrabbing(handle_), "MV_CC_StartGrabbing"))
-    throw std::runtime_error("cannot start acquisition");
+  if (thread_.joinable()) return;
+  if (!device_) device_ = open();
+  device_->start_grabbing();
   mailbox_.reset();
-  quit_ = false;
-  capture_thread_ = std::thread([this] { capture_loop(); });
+  thread_ = std::jthread([this](const std::stop_token stop) { capture(stop); });
 }
 
 void GpuCamera::stop()
 {
-  if (!capture_thread_.joinable()) return;
-  quit_ = true;
-  capture_thread_.join();
-  if (handle_) MV_CC_StopGrabbing(handle_);
+  if (!thread_.joinable()) return;
+  thread_.request_stop();
+  thread_.join();
   mailbox_.close();
+  if (device_) device_->stop_grabbing();
 }
 
-bool GpuCamera::read(GpuFrame & frame)
+std::optional<GpuFrame> GpuCamera::read()
 {
   // Everything queued on the stream for the previous frame, ours and the caller's, must be done
   // before acquire() hands that frame's raw slot back to the capture thread.
-  check(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
-  const Slot * slot = mailbox_.acquire();
-  if (!slot) return false;
+  cuda::check(cudaStreamSynchronize(stream_.get()), "cudaStreamSynchronize");
+  const Slot * const slot = mailbox_.acquire();
+  if (!slot) return std::nullopt;
 
-  check(
-    launch_demosaic(
-      slot->device, int(geometry_.width), int(geometry_.height), bayer_, roi_, output_, stream_),
-    "demosaic launch");
-  frame = {output_,        roi_.width, roi_.height, size_t(roi_.width) * sizeof(uchar4),
-           stream_,        slot->timestamp,         slot->index};
-  return true;
+  launch_demosaic(slot->raw.device(), width(), height(), bayer_, output_.get(), stream_.get());
+  return GpuFrame{output_.get(), width(), height(), stream_.get(), slot->timestamp, slot->index};
 }
 
-bool GpuCamera::open_device(Geometry & geometry)
+std::unique_ptr<MvsDevice> GpuCamera::open() const
 {
-  MV_CC_DEVICE_INFO_LIST devices{};
-  if (!ok(MV_CC_EnumDevices(MV_USB_DEVICE, &devices), "MV_CC_EnumDevices")) return false;
-  if (devices.nDeviceNum == 0) {
-    std::fprintf(stderr, "no USB camera found\n");
-    return false;
-  }
-
-  if (
-    !ok(MV_CC_CreateHandle(&handle_, devices.pDeviceInfo[0]), "MV_CC_CreateHandle") ||
-    !ok(MV_CC_OpenDevice(handle_), "MV_CC_OpenDevice") ||
-    !ok(MV_CC_FeatureLoad(handle_, ini_path_.c_str()), "MV_CC_FeatureLoad") ||
-    !read_int(handle_, "Width", geometry.width) || !read_int(handle_, "Height", geometry.height) ||
-    !read_int(handle_, "PayloadSize", geometry.payload)) {
-    close_device();
-    return false;
-  }
-
-  MVCC_ENUMVALUE format;
-  if (!ok(MV_CC_GetEnumValue(handle_, "PixelFormat", &format), "PixelFormat")) {
-    close_device();
-    return false;
-  }
-  geometry.pixel_type = format.nCurValue;
-  return true;
+  auto device = std::make_unique<MvsDevice>(ini_path_);
+  if (device->geometry() != geometry_) throw std::runtime_error("camera geometry changed");
+  return device;
 }
 
-void GpuCamera::close_device()
-{
-  if (!handle_) return;
-  MV_CC_CloseDevice(handle_);
-  MV_CC_DestroyHandle(handle_);
-  handle_ = nullptr;
-}
-
-void GpuCamera::capture_loop()
+void GpuCamera::capture(const std::stop_token & stop)
 {
   int failures = 0;
-  while (!quit_) {
+  while (!stop.stop_requested()) {
     Slot & slot = mailbox_.write_slot();
-    MV_FRAME_OUT_INFO_EX info{};
-    const int ret =
-      MV_CC_GetOneFrameTimeout(handle_, slot.host, geometry_.payload, &info, kTimeoutMs);
-    if (ret != MV_OK) {
+    const auto index = device_->get_frame(slot.raw.span(), kFrameTimeout);
+    if (!index) {
       if (++failures >= kMaxFailures) {
-        recover();
+        recover(stop);
         failures = 0;
       }
       continue;
     }
     failures = 0;
-
-    // A frame of a different size would be misread by the kernel.
-    if (info.nFrameLen != geometry_.payload) continue;
-
     slot.timestamp = std::chrono::steady_clock::now();
-    slot.index = info.nFrameNum;
+    slot.index = *index;
     mailbox_.publish();
   }
 }
 
 // Reopen after the camera stopped delivering frames, e.g. a replugged USB cable.
-void GpuCamera::recover()
+void GpuCamera::recover(const std::stop_token & stop)
 {
-  std::fprintf(stderr, "no frames, reopening the camera\n");
-  if (handle_) MV_CC_StopGrabbing(handle_);
-  close_device();
-  while (!quit_) {
-    std::this_thread::sleep_for(100ms);
-    Geometry geometry;
-    if (
-      open_device(geometry) && geometry == geometry_ &&
-      ok(MV_CC_StartGrabbing(handle_), "MV_CC_StartGrabbing"))
+  std::fputs("no frames, reopening the camera\n", stderr);
+  device_.reset();  // the camera is opened exclusively, so release it before reopening
+  while (!stop.stop_requested()) {
+    std::this_thread::sleep_for(kRetryDelay);
+    try {
+      auto device = open();
+      device->start_grabbing();
+      device_ = std::move(device);
       return;
-    close_device();
+    } catch (const std::exception & e) {
+      std::fprintf(stderr, "reopen failed: %s\n", e.what());
+    }
   }
 }
 

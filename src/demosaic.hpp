@@ -1,4 +1,4 @@
-// Purpose: Declare the GPU Bayer-to-BGRA conversion with a fused region-of-interest crop.
+// Purpose: Declare the GPU Bayer-to-BGRA conversion.
 // Paradigm: Thin host launcher over a single CUDA kernel.
 // Role: Turns raw sensor frames into the pixels that downstream GPU work consumes.
 
@@ -13,21 +13,12 @@
 
 namespace io
 {
-struct Roi
-{
-  int x = 0;
-  int y = 0;
-  int width = 0;  // 0 selects the full frame
-  int height = 0;
-};
-
-// Converts the `roi` region of a raw 8-bit Bayer frame (`raw_width` x `raw_height`, tightly
-// packed, device-accessible) to BGRA8 in `out` (`roi.width` x `roi.height`, tightly packed).
-// Only the roi pixels are computed. Asynchronous on `stream`; the caller keeps `raw` and `out`
-// alive until the stream passes this point. Returns the launch status.
-cudaError_t launch_demosaic(
-  const uint8_t * raw, int raw_width, int raw_height, const Bayer & pattern, const Roi & roi,
-  uchar4 * out, cudaStream_t stream);
+// Converts a raw 8-bit Bayer frame (`width` x `height`, tightly packed, device-accessible) to
+// BGRA8 in `out` (same size, tightly packed). Asynchronous on `stream`; the caller keeps `raw`
+// and `out` alive until the stream passes this point. Throws if the launch fails.
+void launch_demosaic(
+  const std::uint8_t * raw, int width, int height, const Bayer & pattern, uchar4 * out,
+  cudaStream_t stream);
 
 }  // namespace io
 
