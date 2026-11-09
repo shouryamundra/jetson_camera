@@ -47,6 +47,11 @@ add_library(jetson_camera src/camera.cc src/config.cc src/frame.cc src/recorder.
 target_include_directories(jetson_camera PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(jetson_camera PUBLIC CUDA::cudart Threads::Threads MvCameraControl PkgConfig::GST)
 jc_strict(jetson_camera)
+
+add_executable(capture_bench demo/capture_bench.cu)
+target_link_libraries(capture_bench jetson_camera)
+add_executable(usb_reset tools/usb_reset.cc)
+jc_strict(usb_reset)
 add_executable(bayer_test tests/bayer_test.cc)
 target_include_directories(bayer_test PRIVATE ${CMAKE_SOURCE_DIR})
 jc_strict(bayer_test)
