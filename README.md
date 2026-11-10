@@ -1,37 +1,59 @@
 # jetson_camera
 
-Hikrobot USB camera → pinned memory shared by CPU and GPU → CUDA demosaic to BGRA → optional
-hardware H.265 recording to `.mkv`. Built for Jetson Orin (JetPack 6.1).
+Low-latency capture for a Hikrobot USB3 camera on Jetson Orin. Each frame goes
+from USB to a model-ready GPU tensor in one CUDA kernel, with no CPU copy, and
+carries the time it was exposed.
 
 ```cpp
-io::Camera camera("config/camera.ini");
-io::Recorder recorder("out.mkv", camera.width(), camera.height(), {.fps = 60});
-while (auto frame = camera.read()) {
-  my_kernel<<<grid, block, 0, frame->stream>>>(frame->bgra, frame->width, frame->height);
-  recorder.record(*frame);  // optional; copies the finished frame into the encoder
+jc::Camera camera(config.camera, [&](const jc::FrameRef& f) { recorder.Push(f); });
+
+std::uint64_t seen = 0;
+while (running) {
+  auto frame = camera.Latest(seen, 100ms);  // newest frame, never a backlog
+  if (!frame) continue;
+  seen = frame->info().seq;
+  Infer(frame->buffers().tensor);           // 1x3x540x960 fp16, on the GPU
+  Track(frame->info().ExposureMidUs());     // CLOCK_REALTIME microseconds
 }
 ```
 
-- `read()` waits for the previous frame's GPU work, takes the frame the SDK holds (at most one
-  frame old) and queues the demosaic on `frame.stream`. Queue your work on that stream; anything
-  on another stream must finish before the next `read()`, which overwrites the frame.
-- `record()` skips frames faster than `fps` and drops frames if the encoder is 3 behind.
-- GStreamer: `appsrc (BGRx) ! nvvidconv ! NVMM NV12 ! nvv4l2h265enc ! h265parse ! matroskamux`.
+## Performance
 
-## Build and run on the Jetson
+AGX Orin, MV-CS016-10UC, 4 ms exposure, clocks locked, recording at 30 fps,
+15 ms of simulated inference running alongside:
+
+| | |
+|---|---|
+| Capture | 216 fps, no frames lost |
+| USB frame to tensor ready | 0.23 ms (p99 0.35 ms) |
+| Frame age when the detector takes it | 9.4 ms from mid-exposure (p99 11.6 ms) |
+| Recording | 30 fps, 6.7 ms to encode, never delays capture |
+
+## Features
+
+- **Newest frame only.** A slow consumer gets the latest frame; capture never
+  waits for anyone.
+- **Zero copy.** The GPU reads the SDK's receive buffers directly, and the
+  recorder encodes straight from the frame pool.
+- **One kernel per frame.** Demosaic, 1.5x area downscale, fp16 tensor and the
+  NV12 frame for the encoder in a single pass.
+- **Exposure timestamps** derived from the camera clock, about 30 us jitter.
+- **Self-healing.** A watchdog reopens the camera after a disconnect or stall
+  and resets its USB port if needed.
+- **One config file.** Every tunable lives in `config/pipeline.ini`; unknown
+  keys are errors.
+
+## Setup
+
+Needs JetPack 6, the MVS SDK 4.9 runtime in `/opt/MVS`, and GStreamer headers.
 
 ```sh
-sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev   # MVS runtime in /opt/MVS
-# Check the hardware path first:
-gst-inspect-1.0 nvvidconv | grep -A3 "SINK template" -m1    # must list BGRx for video/x-raw
-gst-launch-1.0 -e videotestsrc num-buffers=300 ! video/x-raw,format=BGRx,width=1440,height=1080 \
-  ! nvvidconv ! 'video/x-raw(memory:NVMM),format=NV12' ! nvv4l2h265enc ! h265parse \
-  ! matroskamux ! filesink location=test.mkv
+sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+sudo deploy/setup_jetson.sh            # journal, USB power, RT limits, USB IRQs
 cmake -B build && cmake --build build -j && (cd build && ctest)
-./build/capture_demo config/camera.ini --seconds 20 --record out.mkv --fps 60
-ffprobe out.mkv
+export MVCAM_COMMON_RUNENV=/opt/MVS/lib
+deploy/run_rt.sh ./build/capture_bench --seconds 30 --record out.mkv
 ```
 
-To check frames are fresh: with slow processing, the printed frame counter should jump by the
-number of frames that arrived in between. A killed recording may lack an index; repair it with
-`ffmpeg -i out.mkv -c copy fixed.mkv`.
+Camera image settings are in `config/camera.ini` (an MVS feature file).
+`deploy/README.md` covers core pinning and isolation.
