@@ -2,27 +2,35 @@
 //
 // appsrc wraps each frame's pinned NV12 plane (zero copy; GStreamer releases
 // the FrameRef); leaky-downstream drops the oldest queued frame; pad probes
-// measure the encoder.
+// measure the encoder. splitmuxsink rotates segments and deletes the oldest;
+// a monitor thread checks free space once a second.
 
 #include "src/recorder.h"
 
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
+#include <sys/statvfs.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cinttypes>
+#include <condition_variable>
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 namespace jetson_camera {
 namespace {
 
 constexpr std::size_t kMaxPending = 256;
+constexpr std::uint64_t kResumePercent = 120;  // Hysteresis: resume at 120%.
 
 std::int64_t SteadyUs() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -31,9 +39,17 @@ std::int64_t SteadyUs() {
 }
 
 // NV12 from system memory -> VIC copies it into NVMM (no colour conversion)
-// -> NVENC H.265.
+// -> NVENC H.265, a keyframe (with SPS/PPS) every second so every segment is
+// independently playable.
 std::string Describe(int width, int height, const RecorderOptions& o) {
   const int rate = o.fps > 0 ? o.fps : 240;
+  const std::string sink =
+      o.segment_s > 0
+          ? "splitmuxsink name=sink muxer-factory=matroskamux "
+            "async-finalize=true send-keyframe-requests=true max-size-time=" +
+                std::to_string(std::int64_t{o.segment_s} * 1'000'000'000) +
+                " max-files=" + std::to_string(o.max_files)
+          : "matroskamux ! filesink name=sink";
   return "appsrc name=source is-live=true format=time block=false "
          "leaky-type=downstream max-buffers=" +
          std::to_string(o.queue) +
@@ -41,9 +57,27 @@ std::string Describe(int width, int height, const RecorderOptions& o) {
          std::to_string(width) + ",height=" + std::to_string(height) +
          ",framerate=" + std::to_string(rate) +
          "/1 ! nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
-         "nvv4l2h265enc bitrate=" +
-         std::to_string(o.bitrate) +
-         " ! h265parse name=parse ! queue ! matroskamux ! filesink name=sink";
+         "nvv4l2h265enc insert-sps-pps=true iframeinterval=" +
+         std::to_string(rate) + " idrinterval=" + std::to_string(rate) +
+         " bitrate=" + std::to_string(o.bitrate) +
+         " ! h265parse name=parse ! queue name=written ! " + sink;
+}
+
+// "out.mkv" -> "out_%05d.mkv"; a path that already has '%' is kept.
+std::string SegmentPattern(const std::string& path) {
+  if (path.find('%') != std::string::npos) return path;
+  const std::filesystem::path p(path);
+  return (p.parent_path() /
+          (p.stem().string() + "_%05d" + p.extension().string()))
+      .string();
+}
+
+// Free bytes for unprivileged users on the filesystem holding `dir`.
+std::uint64_t FreeBytes(const std::string& dir) {
+  struct statvfs s{};
+  if (statvfs(dir.c_str(), &s) != 0)
+    return UINT64_MAX;  // Unknown: don't block.
+  return static_cast<std::uint64_t>(s.f_bavail) * s.f_frsize;
 }
 
 void ReleaseFrame(gpointer frame) { delete static_cast<FrameRef*>(frame); }
@@ -72,6 +106,32 @@ struct Recorder::Impl {
   mutable std::mutex mutex;  // Guards stats and pending (GStreamer threads).
   RecorderStats stats;
   std::unordered_map<std::uint64_t, std::int64_t> pending;  // PTS -> push us.
+
+  // Free-space monitor: the hot path only reads disk_low.
+  std::atomic<bool> disk_low{false};
+  std::atomic<std::uint64_t> disk_skipped{0};
+  std::mutex monitor_mutex;
+  std::condition_variable monitor_cv;
+  bool monitor_stop = false;
+  std::thread monitor;
+
+  void MonitorDisk(const std::string& dir) {
+    const std::uint64_t min_free =
+        static_cast<std::uint64_t>(options.min_free_mb) << 20;
+    std::unique_lock lock(monitor_mutex);
+    do {  // Check immediately, then once a second until stopped.
+      const std::uint64_t free = FreeBytes(dir);
+      if (!disk_low && free < min_free) {
+        disk_low = true;
+        std::fprintf(stderr, "recorder: %" PRIu64 " MB free, pausing\n",
+                     free >> 20);
+      } else if (disk_low && free > min_free / 100 * kResumePercent) {
+        disk_low = false;
+        std::fputs("recorder: disk space recovered, resuming\n", stderr);
+      }
+    } while (!monitor_cv.wait_for(lock, std::chrono::seconds(1),
+                                  [this] { return monitor_stop; }));
+  }
 
   static GstPadProbeReturn OnEncoded(GstPad*, GstPadProbeInfo* info,
                                      gpointer self_ptr) {
@@ -120,14 +180,16 @@ Recorder::Recorder(const std::string& path, int width, int height,
         gst_bin_get_by_name(GST_BIN(m.pipeline.get()), name));
   };
   m.source = find("source");
-  g_object_set(find("sink").get(), "location", path.c_str(), nullptr);
+  const std::string location =
+      options.segment_s > 0 ? SegmentPattern(path) : path;
+  g_object_set(find("sink").get(), "location", location.c_str(), nullptr);
 
   const std::unique_ptr<GstPad, Unref> encoded(
       gst_element_get_static_pad(find("parse").get(), "src"));
   gst_pad_add_probe(encoded.get(), GST_PAD_PROBE_TYPE_BUFFER, &Impl::OnEncoded,
                     &m, nullptr);
   const std::unique_ptr<GstPad, Unref> written(
-      gst_element_get_static_pad(find("sink").get(), "sink"));
+      gst_element_get_static_pad(find("written").get(), "src"));
   gst_pad_add_probe(written.get(), GST_PAD_PROBE_TYPE_BUFFER, &Impl::OnWritten,
                     &m, nullptr);
 
@@ -135,9 +197,22 @@ Recorder::Recorder(const std::string& path, int width, int height,
       GST_STATE_CHANGE_FAILURE) {
     throw std::runtime_error("cannot start the encoder pipeline");
   }
+  if (options.min_free_mb > 0) {
+    std::string dir = std::filesystem::path(location).parent_path().string();
+    if (dir.empty()) dir = ".";
+    m.monitor = std::thread([&m, dir] { m.MonitorDisk(dir); });
+  }
 }
 
 Recorder::~Recorder() {
+  if (impl_->monitor.joinable()) {
+    {
+      std::lock_guard lock(impl_->monitor_mutex);
+      impl_->monitor_stop = true;
+    }
+    impl_->monitor_cv.notify_all();
+    impl_->monitor.join();
+  }
   gst_app_src_end_of_stream(GST_APP_SRC(impl_->source.get()));
   const std::unique_ptr<GstBus, Unref> bus(
       gst_element_get_bus(impl_->pipeline.get()));
@@ -155,6 +230,10 @@ Recorder::~Recorder() {
 
 void Recorder::Push(const FrameRef& frame) {
   Impl& m = *impl_;
+  if (m.disk_low.load(std::memory_order_relaxed)) {
+    m.disk_skipped.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   const std::int64_t t = frame.info().exposure_start_us;
   // Deadline pacing: record the first frame at or after each 1/fps tick (a
   // quarter period early is allowed), so the average rate matches `fps`.
@@ -189,7 +268,10 @@ void Recorder::Push(const FrameRef& frame) {
 
 RecorderStats Recorder::stats() const {
   std::lock_guard lock(impl_->mutex);
-  return impl_->stats;
+  RecorderStats s = impl_->stats;
+  s.disk_skipped = impl_->disk_skipped;
+  s.disk_low = impl_->disk_low;
+  return s;
 }
 
 }  // namespace jetson_camera

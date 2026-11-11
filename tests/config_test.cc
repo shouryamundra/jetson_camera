@@ -45,7 +45,8 @@ int main() {
   const std::string good =
       "# comment\n[camera]\nfeature_file = camera.ini ; trailing comment\n"
       "exposure_us = 4000\n[output]\ntensor_fp16 = false\n"
-      "[recorder]\nfps = 45\n[watchdog]\nstall_ms = 250\n";
+      "[recorder]\nfps = 45\nsegment_s = 10\nmax_files = 5\n"
+      "[watchdog]\nstall_ms = 250\n";
   const jc::PipelineConfig c = jc::LoadPipelineConfig(
       Write(good), {"recorder.bitrate=4000000", "camera.gain_db=9.5"});
   EXPECT(c.camera.feature_file == "/tmp/camera.ini");  // Relative to the file.
@@ -55,6 +56,8 @@ int main() {
   EXPECT(c.camera.sensor_height == 812);  // Untouched default.
   EXPECT(c.camera.stall_ms == 250);
   EXPECT(c.recorder.fps == 45);
+  EXPECT(c.recorder.segment_s == 10 && c.recorder.max_files == 5);
+  EXPECT(c.recorder.min_free_mb == 1024);  // Default.
   EXPECT(c.recorder.bitrate == 4'000'000);
 
   const jc::PipelineConfig d = jc::LoadPipelineConfig(Write("[recorder]\n"));

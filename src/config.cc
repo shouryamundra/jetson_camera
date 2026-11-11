@@ -180,6 +180,9 @@ PipelineConfig LoadPipelineConfig(const std::string& path,
   values.Get("recorder.bitrate", &rec.bitrate, 100'000, 200'000'000);
   values.Get("recorder.queue", &rec.queue, 1, 64);
   values.Get("recorder.finish_timeout_ms", &rec.finish_timeout_ms, 0, 60'000);
+  values.Get("recorder.segment_s", &rec.segment_s, 0, 3600);
+  values.Get("recorder.max_files", &rec.max_files, 0, 100'000);
+  values.Get("recorder.min_free_mb", &rec.min_free_mb, 0, 1'000'000);
 
   values.RejectUnused();
   if (cam.out_width % 2 != 0 || cam.out_height % 2 != 0) {
