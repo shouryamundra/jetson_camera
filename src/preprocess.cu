@@ -1,4 +1,4 @@
-﻿// The fused Bayer -> {tensor, BGR, NV12} kernel.
+// The fused Bayer -> {tensor, BGR, NV12} kernel.
 //
 // One thread per 2x2 output block: load the 5x5 Bayer window once into
 // registers (read-only cache), demosaic the 3x3 source pixels it covers,

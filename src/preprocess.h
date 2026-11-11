@@ -1,4 +1,4 @@
-﻿// The fused Bayer -> {model tensor, BGR image, NV12 video frame} GPU pass: one
+// The fused Bayer -> {model tensor, BGR image, NV12 video frame} GPU pass: one
 // kernel launch per frame, every output pixel computed once from raw data.
 
 #ifndef JETSON_CAMERA_SRC_PREPROCESS_H_
