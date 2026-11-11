@@ -73,9 +73,11 @@ target_link_libraries(preprocess_test jetson_camera)
 add_test(NAME preprocess_test COMMAND preprocess_test)
 
 # compute-sanitizer: out-of-bounds/misaligned access, races in shared memory,
-# uninitialised reads. Run with: ctest -L sanitizer
+# uninitialised reads. Opt-in, because Jetson only allows GPU debugging as
+# root: cmake -B build -DJC_SANITIZER_TESTS=ON && sudo ctest --test-dir build -L sanitizer
+option(JC_SANITIZER_TESTS "Add compute-sanitizer tests (need root on Jetson)" OFF)
 find_program(COMPUTE_SANITIZER compute-sanitizer HINTS /usr/local/cuda/bin)
-if(COMPUTE_SANITIZER)
+if(JC_SANITIZER_TESTS AND COMPUTE_SANITIZER)
   foreach(tool memcheck racecheck initcheck synccheck)
     add_test(NAME preprocess_${tool} COMMAND ${COMPUTE_SANITIZER} --tool ${tool} --error-exitcode 1 $<TARGET_FILE:preprocess_test>)
     set_tests_properties(preprocess_${tool} PROPERTIES LABELS sanitizer)
